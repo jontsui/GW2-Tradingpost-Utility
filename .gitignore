@@ -6,8 +6,6 @@
 *.csv
 /__pycache__
 /data_files
-/database
-/deprecated_code
 /utilities/__pycache__
 testing.py
 

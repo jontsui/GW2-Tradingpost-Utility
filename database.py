@@ -12,7 +12,16 @@ class DatabaseConnection:
 		except:
 			print('Cannot connect to database')
 			print(sys.exc_info()[1])
+
+	def __enter__(self):
+		return self
+
+	def __exit__(self, *args):
+		self.connection.close()
 	
+	def close(self):
+		self.connection.close()
+
 	def test(self):
 		return self.connection.status
 		
@@ -62,9 +71,6 @@ class DatabaseConnection:
 
 	def commit(self):
 		self.connection.commit()
-	
-	def close(self):
-		self.connection.close()
 
 class Gw2Database(DatabaseConnection):
 	def __init__(self, autocommit = False):
@@ -83,7 +89,7 @@ class Gw2Database(DatabaseConnection):
 		except:
 			return None
 
-	def ingredients(self, item_identifier):
+	def _ingredients(self, item_identifier):
 		''' Returns a list of dictionaries for item_identifier argument 
 		(name or ID) representing required crafting ingredients one level lower. 
 		Return value: [{item_id: <> ,item_name: <> , count: <> }, ...]
@@ -112,7 +118,6 @@ class Gw2Database(DatabaseConnection):
 		else:
 			return None
 	
-	
 	def base_ingredients(self, item_identifier):		
 		''' Returns list of dictionaries of item_identifier argument (name or ID) 
 		representing the absolute base crafting ingredients.  
@@ -124,7 +129,7 @@ class Gw2Database(DatabaseConnection):
 		else:
 			item_id = item_identifier
 
-		result = self.ingredients(item_id) 
+		result = self._ingredients(item_id) 
 		temp = [] # To store intermediate results for each iteration
 		
 		# If item has no crafting ingredients listed in database
@@ -133,11 +138,11 @@ class Gw2Database(DatabaseConnection):
 	
 		# Should evaluate false only when members in list 'result' all evaluate
 		# to None (no lower ingredients)
-		while any([self.ingredients(upper['item_id']) for upper in result]):
+		while any([self._ingredients(upper['item_id']) for upper in result]):
 
 			for upper in result:	
 				# If upper level ingredient is already base, then append to results list
-				if self.ingredients(upper['item_id']) is None:
+				if self._ingredients(upper['item_id']) is None:
 					temp.append(upper)
 				
 				else: 
@@ -147,7 +152,7 @@ class Gw2Database(DatabaseConnection):
 					output_quantity = self.cursor.fetchone()[0]
 					
 					# Retrieve lower level ingredients for upper item
-					lower_list = self.ingredients(upper['item_id']) # List of dictionaries
+					lower_list = self._ingredients(upper['item_id']) # List of dictionaries
 					
 					#Adjusts the count of lower level ingredients
 					for lower in lower_list:
@@ -159,7 +164,7 @@ class Gw2Database(DatabaseConnection):
 			result = temp	# Reset the upper_list to current result list
 			temp = [] 		# Important! Otherwise infinite loop
 		
-		def condense(base_list):
+		def _condense(base_list):
 			'''Inner function: merges duplicate dictionaries that have 
 			same item_id/item_name value and combining their counts value'''
 		
@@ -175,43 +180,44 @@ class Gw2Database(DatabaseConnection):
 				# If ingredient dictionary is a duplicate, update the 'count' key for corresponding 
 				# entry in result list
 				else:
-					index = find(result_list, 'item_id', item_id) 
+					index = _find(result_list, 'item_id', item_id) 
 					result_list[index]['count'] += base_d['count']
 			return result_list
 		
-		def find(lst, key, value):
+		def _find(lst, key, value):
 			'''Inner function: Finds the index of first dict from list of dicts 
-			where dic[key] == value.  To be used with inner function condense'''
+			where dic[key] == value.  To be used with inner function _condense'''
 			for i, dic in enumerate(lst):
 				if dic[key] == value:
 					return i
 			return None
 		
-		return condense(result)
+		return _condense(result)
 
-	def vendor_price(self, item_id, *flags): 
-		''' Fetches vendor price of item_id arg from the vendor table in database.
-		Optional argument flags: 'boolean' causes function to return True or False 
-		depending whether item exists in table'''
+	def vendor_price(self, item_id): 
+		''' Fetches vendor price of item_id arg from the vendor table in database.'''
 		
 		query = 'SELECT * FROM vendor_items where item_id = %s'
 		self.cursor.execute(query, (item_id,))
 		try:
-			result = self.cursor.fetchone()[1] # (item_id, price, count)
-			if boolean:
-				return True
-			return result
-		except:
-			if boolean:
-				return False
-			return 0
+			result = self.cursor.fetchone() # (item_id, price, count)
+			return result[1]
+		except TypeError:
+			# result set is empty (i.e. item is not in vendor table)
+			return None
 
 if __name__ == '__main__':
-	#Oiled Forged Scrap: 82796
-	#Green Torch Handle recipe: 4458
-	#Rough Sharpening Stone: 9431
-	#Lump of Primordium: 19924
-	#Gossamer Patch: 76614
-	gw2db = Gw2Database()
-	for x in gw2db.base_ingredients("berserker's draconic coat"):
-		print(x)
+	def unit_test1():
+		""" 
+		Oiled Forged Scrap: 82796
+		Green Torch Handle recipe: 4458
+		Rough Sharpening Stone: 9431
+		Lump of Primordium: 19924
+		Gossamer Patch: 76614 
+		"""
+		with Gw2Database() as conn:
+			for x in conn.base_ingredients("berserker's draconic coat"):
+				print(x)
+
+	unit_test1()
+

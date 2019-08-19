@@ -1,168 +1,143 @@
-from database import Gw2Database
+import database
+import threadpool
 import gw2api
-from threading import Thread
-from queue import Queue
-import os
 
-# Returns a dictionary of form {item_id: unit_cost, ... }
-def make_vendor_dict():
-    gw2db  = Gw2Database()
-    query = 'select item_id, price from vendor_items'
-    gw2db.cursor.execute(query)
-    return dict(gw2db.cursor.fetchall())
 
-def vendor_price(item_id, vendor_dict):
-    if item_id in vendor_dict.keys():
-        return vendor_dict[item_id]
-    else:
-        return None
-
-class ThreadPool:
-    def __init__(self, num_threads):
-        
-        # Reference to these objects will be passed to each thread
-        self.queue = Queue()
-        self.results = []
-    
-        self.num_threads = num_threads
-    
-    def add_task(self, func, *args, **kwargs):
-        '''Adds a tuple to the queue containing the function and arguments to be called by each thread'''
-        self.queue.put((func, args, kwargs)) # (func, [], {}), Note inner parenthesis
-    
-    def start(self):
-        '''Start all threads'''
-        for i in range(self.num_threads):
-            # Create thread objects and pass in ThreadPool's queue and results object for thread objects to work on
-            WorkerThread(self.queue, self.results)
-    
-    def join(self):
-        '''Blocks execution until queue has been exhausted'''
-        self.queue.join()
-    
-    def stop_threads(self):
-        '''Populate queue with None tuples to signal threads to stop'''
-        for i in range(self.num_threads):
-            self.queue.put((None, None, None))
-
-class WorkerThread(Thread):
-    def __init__(self, queue, results,):
-        #queue, results, lock arguments are references to the ThreadPool object.
-        Thread.__init__(self)
-        self.queue = queue
-        self.results = results
-        self.start()
-    
-    def run(self):
-        while True:
-            func, args, kwargs = self.queue.get()
-            # Stop the thread when it fetches None from queue
-            if func is None:
-                # print('Thread {} terminating'.format(self.name))
-                break
-            
-            self.results.append(func(*args, **kwargs))   
-            self.queue.task_done()
-
-def crafting_cost(item_identifier, info = False):
-    ''' Note that this function is threaded and establishes a database connection.
+def crafting_cost(item_identifier, *, debug = False):
+    ''' Creates 1 (+ 1) connections and N threads per call (N = # ingredients in base list).
     Arguments: 'item_identifier' is either an item name or id
                
-               info is a flag which when set forces function to return a list 
+               'info' is a flag which when set forces function to return a list 
                of dictionaries with full information about ingredient costs
                Return value: [{item_id: , item_name, count:, unit_cost: ,total_cost: }, ...]
-               '''
+    '''
+
+    with database.Gw2Database() as conn: # Connection here
+        base_ingredients = conn.base_ingredients(item_identifier)
     
-    gw2db = Gw2Database()
-    vendor_dict = make_vendor_dict() # To be accessed by worker function
-    ingredients = gw2db.base_ingredients(item_identifier)
-    
-    # Defining worker function
-    def worker(ingredient):
-        '''Ingredient argument is a dictionary from base ingredients list.  
+    def worker(ingredient_dict):
+        '''Argument is a dictionary from base ingredients list.  
         Looks up the item_id against gw2 api's TP listings.
-        Returns an augmented dictionary with two additional keys - 'unit_cost' and 'total_cost' '''
+        Returns ingredient dictionary with two additional keys - 'unit_cost' and 'total_cost' '''
         
-        item_id = ingredient['item_id']
+        item_id = ingredient_dict['item_id']
         
         # We assume that the priority of where you buy the item from will be 
         # 1) vendor, 2) buy listings, 3) sell listings
-        unit_cost = vendor_price(item_id, vendor_dict)
+        with database.Gw2Database() as conn: # Connection here
+            unit_cost = conn.vendor_price(item_id)
         if unit_cost is None:
             unit_cost = gw2api.v2_listings_buy(item_id)
             if unit_cost == 0:
                 unit_cost = gw2api.v2_listings_sell(item_id)
+                # Defaults to 0 all listings are NA
 
-        ingredient['unit_cost'] = unit_cost
-        ingredient['total_cost'] = unit_cost * ingredient['count']
+        ingredient_dict['unit_cost'] = unit_cost
+        ingredient_dict['total_cost'] = unit_cost * ingredient_dict['count']
 
-        return ingredient
+        return ingredient_dict
 
-    pool = ThreadPool(len(ingredients))
-    # Populate the threadpool queue with dictionaries from ingredients list
-    for ingredient in ingredients:
-        pool.add_task(worker, ingredient)
-
+    pool = threadpool.ThreadPool(len(base_ingredients))
+    for ingredient_dict in base_ingredients:
+        pool.add_task(worker, ingredient_dict)
     pool.start()
     pool.join()
     pool.stop_threads()
-    gw2db.close()
 
-    if info:
-        return pool.results
+    final_cost = sum([item_dict['total_cost'] for item_dict in pool.results])
     
-    return sum([d['total_cost'] for d in pool.results])
+    
+    if debug:
+        # Print all elements in results
+        for ingredient_dict in pool.results:
+            print(ingredient_dict)
+        print(final_cost)
+        import webbrowser
+        webbrowser.open('https://wiki.guildwars2.com/wiki/'+ item_identifier)
 
-def watchlist_compute(input_file, output_file):
+    # Otherwise just return sum of costs
+    return final_cost
+
+def watchlist_compute(input_file, output_file, *, debug = False):
+    if debug:
+        import time
+        start = time.time()
+    
     '''Reads item names from input_file and writes crafting cost, tp sell price, 
     and ROI info for each item to output_file.
     Arguments: input_file, output_file'''
 
-    # Lookup each item name in file, convert to ID, then add to list L
-    gw2db = Gw2Database()
-    with open(input_file) as fin:
-        L = []
-        for line in fin:
-            item_name = line.rstrip('\n')
-            item_id = gw2db.name_to_id(item_name)
-            L.append({'item_id': item_id , 'item_name': item_name})
+    # Lookup each item name in file, convert to ID, then add to items_to_compute
+    with database.Gw2Database() as conn:
+        with open(input_file) as fin:
+            items_to_compute = []
+            for line in fin:
+                item_name = line.rstrip('\n')
+                item_id = conn.name_to_id(item_name)
+                items_to_compute.append({'item_id': item_id , 'item_name': item_name})
     
     # Create a blank file, write current time, and column headers
     import datetime
     with open(output_file, 'w') as newfile:
         newfile.write(str(datetime.datetime.now()) + '\n')
-        column_labels = 'name', 'craft_cost', 'sell', 'ROI'
+        column_labels = 'name', 'craft_cost', 'sell_listing', 'ROI'
         newfile.write('{:>35} {:>20} {:>15} {:>15}\n'.format(*column_labels))
 
-    # Write info to file
-    
-    print('Writing...')
-    with open(output_file, 'a+') as fout:
-        for item_dict in L:
-            craft = crafting_cost(item_dict['item_id'])
-            sell = gw2api.v2_listings_sell(item_dict['item_id'])
-            try:
-                # Potentially DivisionByZero Exception
-                roi = int((sell*0.85-craft)/craft*100)
-            except:
-                roi = 0
-                
-            tup = item_dict['item_name'], gold(craft), gold(sell), str(roi)
-            # Change this line specify minimum roi
-            if roi > 40:
-                fout.write('{:>35} {:>20} {:>15} {:>15}\n'.format(*tup))
-    
-    print('Done')
-        
 
-def gold(value): #123793
+    def worker(item_dict):
+        # item_dict - {'item_id': <>, 'item_id': <>}'''
+        if debug:
+            print('Starting new task')
+        
+        _id = item_dict['item_id']
+        
+        item_dict['craft_cost'] = crafting_cost(_id)
+        item_dict['sell_listing'] = gw2api.v2_listings_sell(_id)
+
+        # item_dict - {'item_id': <>, 'item_id': <>, 'crafting_cost': <>, 'sell_listing': <>}
+        return item_dict
+
+    pool = threadpool.ThreadPool(15)
+    for item_dict in items_to_compute:
+        pool.add_task(worker, item_dict)
+    pool.start()
+    pool.join()
+    pool.stop_threads
+
+    if debug:
+        for res in pool.results:
+            print(res)
+        print(len(pool.results), len(items_to_compute)) # Check for correctness
+        end = time.time()
+        print(end-start) # Get runtime
+        return
+    
+    with open(output_file, 'a+') as fout:
+        for item_dict in pool.results:
+            line = (item_dict['item_name'], 
+                  _gold(item_dict['craft_cost']),
+                  _gold(item_dict['sell_listing']), 
+                  _roi(item_dict['craft_cost'], 
+                  item_dict['sell_listing']))
+            fout.write('{:>35} {:>20} {:>15} {:>15}\n'.format(*line))
+        
+def _roi(craft, sell):
+    '''Return on investment, returns an integer'''
+    try:
+        # Potentially DivisionByZero Exception
+        roi = int((sell*0.85-craft)/craft*100)
+    except:
+        roi = 0
+    return str(roi)
+
+def _gold(value): #123793
     '''Returns a string representing an integer's equivalent gold value'''
     gold = value//10000
     silver = (value-gold*10000)//100
     copper = (value-gold*10000-silver*100)
     return '{}g {}s {}c'.format(gold, silver, copper)
 
-def remove_quotes(input_file):
+def __remove_quotes(input_file):
     L = []
     with open(input_file, 'r+') as f: 
         for line in f:
@@ -175,22 +150,18 @@ def remove_quotes(input_file):
             f.write(string + '\n')
     
 if __name__ == '__main__':
-    #Oiled Forged Scrap: 82796
-	#Green Torch Handle recipe: 4458
-	#Rough Sharpening Stone: 9431
-	#Lump of Primordium: 19924
-    #Gossamer Patch: 76614
-    import paths
 
-    watchlist_compute(paths.watchlists + 'krait_weapons.csv', paths.watchlists + 'krait_weapons_output.txt')
-
+    def unit_test1():
+        #Oiled Forged Scrap: 82796
+        #Green Torch Handle recipe: 4458
+        #Rough Sharpening Stone: 9431
+        #Lump of Primordium: 19924
+        #Gossamer Patch: 76614
+        x = crafting_cost("Oiled Forged Scrap", debug = False)
+        print(x)
     
-
-
-
-    
-
-
-    
-
+    def unit_test2():
+        import paths
+        watchlist_compute(paths.watchlists + 'runes.csv', 
+                          paths.watchlists + 'runes_output.txt', debug = False)
     
